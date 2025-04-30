@@ -1,0 +1,8 @@
+openai
+sqlalchemy
+logfire
+fastapi
+uvicorn
+pydantic
+pydantic-ai
+python-dotenv
