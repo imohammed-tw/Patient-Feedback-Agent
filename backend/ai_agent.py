@@ -53,6 +53,7 @@ Conversation Flow:
 7. Run `categorize_feedback` on the comments.
 8. Run `save_feedback_to_database` using name, NHS number, rating, category, and comments.
 9. Use `find_common_issues` to show 2–3 issues and close by thanking the user by name.
+10. After feedback collection is complete (feedback_saved = True), use `handle_general_response` for any follow-up messages.
 
 Tool usage is mandatory. Do not respond manually if a tool exists for the action. Be concise, empathetic, and structured.
 
@@ -60,6 +61,8 @@ Variables to track:
 - `satisfaction_rating` (from user)
 - `comments` (from user)
 - `category` (from tool)
+- `feedback_saved` (True when feedback has been saved)
+- `conversation_complete` (True when the entire feedback flow is finished)
 
 
 
@@ -124,7 +127,11 @@ def start_feedback_form_interaction(ctx: RunContext) -> str:
     state = ctx.deps.get("state", {})
     name = ctx.deps.get("name", "there")
 
-    # ✅ Prevent asking again if already rated
+    # Check if feedback flow is already complete
+    if state.get("conversation_complete"):
+        return f"Thanks {name}, I've already collected your feedback. Is there anything else I can help you with?"
+
+    # Prevent asking again if already rated
     if state.get("satisfaction_rating"):
         return f"Thanks {name}, I’ve already noted your rating of {state['satisfaction_rating']}."
 
@@ -135,12 +142,16 @@ def start_feedback_form_interaction(ctx: RunContext) -> str:
     )
 
 
-# 4.start takin feedback (part2)
+# 4.start taking feedback (part2)
 @feedback_agent.tool
 def ask_for_feedback_comments(ctx: RunContext) -> str:
     """Asks the user to describe their negative experience in detail."""
     state = ctx.deps.get("state", {})
     name = ctx.deps.get("name", "there")
+
+    # Check if feedback flow is already complete
+    if state.get("conversation_complete"):
+        return f"Thanks {name}, I've already collected your feedback. Is there anything else I can help you with?"
 
     if state.get("comments"):
         return f"Thanks!, you've already shared your comments: \"{state['comments']}\"."
@@ -208,6 +219,7 @@ def categorize_feedback(ctx: RunContext, comments: str) -> str:
             "building",
             "parking",
             "facility",
+            "environment",
         ],
         "Treatment": [
             "medicine",
@@ -242,7 +254,7 @@ def categorize_feedback(ctx: RunContext, comments: str) -> str:
         best_category = "Other"
 
     uvicorn_logger.info(
-        "✅ Categorization done",
+        "Categorization done",
         extra={"category": best_category, "time": f"{time.time() - start_time:.2f}s"},
     )
 
@@ -263,7 +275,7 @@ def save_feedback_to_database(ctx: RunContext) -> str:
         category = state.get("category")
 
         if not all([name, nhs_number, rating, comments]):
-            return "⚠️ Some required fields (name, rating, or comments) are missing. Please complete the feedback."
+            return "⚠Some required fields (name, rating, or comments) are missing. Please complete the feedback."
 
         category = categorize_feedback(ctx, comments)
 
@@ -277,16 +289,20 @@ def save_feedback_to_database(ctx: RunContext) -> str:
 
         feedback_collection.insert_one(feedback_doc)
         state["feedback_saved"] = True
+        # Mark the conversation as complete after saving feedback
+        state["conversation_complete"] = True
+
         return f"✅ Thanks {name}, your feedback has been saved. We’ll use this to improve our service!"
     except Exception as e:
         return f"❌ Error saving feedback: {str(e)}"
 
 
-# 4️ Identify Recurring Issues
+# 4 Identify Recurring Issues
 @feedback_agent.tool
 def find_common_issues(ctx: RunContext) -> list:
     """Returns top recurring issues based on feedback comment keywords."""
     name = ctx.deps.get("name", "there")
+    state = ctx.deps.get("state", {})
     all_feedback = feedback_collection.find()
     all_comments = " ".join(f.get("comments", "") for f in all_feedback).lower()
 
@@ -323,10 +339,43 @@ def find_common_issues(ctx: RunContext) -> list:
     if not top_issues:
         return [f"No common issues found, {name}."]
 
+    # Set conversation as completed once we reach this step
+    state["conversation_complete"] = True
+
     return [f"• {desc} ({count} mentions)" for desc, count in top_issues]
 
 
-# 5️ Trend Analysis
+# NEW TOOL: Handle general responses after feedback is complete
+@feedback_agent.tool
+def handle_general_response(ctx: RunContext, message: str) -> str:
+    """Handles general responses after the feedback collection is complete."""
+    state = ctx.deps.get("state", {})
+    name = ctx.deps.get("name", "there")
+
+    if not state.get("feedback_saved"):
+        return None
+
+    gratitude_keywords = [
+        "thank",
+        "thanks",
+        "thx",
+        "appreciate",
+        "grateful",
+        "thankyou",
+        "Thank you",
+    ]
+    if any(keyword in message.lower() for keyword in gratitude_keywords):
+        return f"You're welcome, {name}! Your feedback helps us improve our services. If you have any other questions or concerns in the future, please don't hesitate to reach out."
+
+    goodbye_keywords = ["bye", "goodbye", "see you", "farewell"]
+    if any(keyword in message.lower() for keyword in goodbye_keywords):
+        return f"Goodbye, {name}! Thank you for your time and feedback. Have a wonderful day!"
+
+    # Handle general follow-up
+    return f"Thank you for your engagement, {name}. Your feedback has been recorded. Is there anything else you'd like to discuss about our healthcare services?"
+
+
+# 5 Trend Analysis
 @feedback_agent.tool
 def generate_trend_analysis(ctx: RunContext) -> str:
     """Generates a summary report of feedback trends."""
@@ -366,7 +415,7 @@ def generate_trend_analysis(ctx: RunContext) -> str:
     return report
 
 
-# 6️ Critical Issue Alerts
+# 6 Critical Issue Alerts
 @feedback_agent.tool
 def detect_critical_issues(ctx: RunContext) -> list:
     """Scans comments for critical incidents and alerts."""
@@ -405,6 +454,29 @@ def detect_critical_issues(ctx: RunContext) -> list:
     if not critical_issues:
         return [f"No critical issues detected at the moment, {name}."]
     return critical_issues
+
+
+# 7. Check conversation state to determine if we need to start a new feedback flow
+@feedback_agent.tool
+def check_conversation_state(ctx: RunContext) -> str:
+    """Checks the current state of the conversation to determine next actions."""
+    state = ctx.deps.get("state", {})
+    name = ctx.deps.get("name", "there")
+
+    # If we've already completed the feedback flow
+    if state.get("conversation_complete"):
+        return f"feedback_flow_complete"
+
+    # If we're in the middle of the feedback flow
+    if state.get("awaiting_rating"):
+        return "awaiting_rating"
+    elif state.get("awaiting_comments"):
+        return "awaiting_comments"
+    elif state.get("feedback_saved"):
+        return "feedback_saved"
+
+    # Default - new conversation
+    return "new_conversation"
 
 
 # Function to run the agent
