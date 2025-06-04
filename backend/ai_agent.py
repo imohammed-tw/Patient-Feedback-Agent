@@ -8,6 +8,10 @@ from textblob import TextBlob
 from dotenv import load_dotenv
 import os
 from database import users_collection, feedback_collection
+from opentelemetry import trace
+
+# from alerts import send_slack_alert
+from admin_alerts import scan_critical_issues_and_alert
 
 
 load_dotenv()
@@ -29,6 +33,8 @@ uvicorn_logger.handlers = [logfire.LogfireLoggingHandler()]
 # Initialize OpenAI Client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+#  OpenTelemetry Tracer for manual spans
+tracer = trace.get_tracer("ai_agent_tracer")
 
 # Define AI Agent
 feedback_agent = Agent(
@@ -47,13 +53,13 @@ Conversation Flow:
     - If Positive: Thank the user and end the conversation.
     - If Negative: Express empathy, then ask for satisfaction rating (1–5).
 5. When the user replies with a number between 1–5 after being asked for rating, store it as `satisfaction_rating`.Now,
-    - If rating ≥ 3: Acknowledge and ask for details(comments) which made them to rate that number.
-    - If rating ≤ 2: Express concern, and gently ask for more details(comments).
+    - If rating ≥ 3: Ask for detailed comments which made them to rate that number by acknowledging it.
+    - If rating ≤ 2: Express concern, and gently ask for more detailed comments.
 6. After rating, run `ask_for_feedback_comments` to gather structured comments.
 7. Run `categorize_feedback` on the comments.
 8. Run `save_feedback_to_database` using name, NHS number, rating, category, and comments.
-9. Use `find_common_issues` to show 2–3 issues and close by thanking the user by name.
-10. After feedback collection is complete (feedback_saved = True), use `handle_general_response` for any follow-up messages.
+9. Use `find_common_issues` to show 2–3 issues to the user and build trust that team is working on those issues and close by thanking the user by name and set (feedback_saved = True).
+10. At the end, if user also greets/thanks or mentions anything, use `handle_general_response` for any follow-up messages.
 
 Tool usage is mandatory. Do not respond manually if a tool exists for the action. Be concise, empathetic, and structured.
 
@@ -74,409 +80,422 @@ Variables to track:
 @feedback_agent.tool
 def quick_sentiment_check(ctx: RunContext, feedback_text: str) -> str:
     """Determines sentiment for feedback using TextBlob."""
-    try:
-        state = ctx.deps.get("state", {})
-        blob = TextBlob(feedback_text)
-        polarity = blob.sentiment.polarity
-        sentiment = (
-            "Positive"
-            if polarity > 0.2
-            else "Negative" if polarity < -0.2 else "Neutral"
-        )
-        state["sentiment"] = sentiment
-        return sentiment
-    except Exception as e:
-        uvicorn_logger.error(
-            "Error in quick sentiment analysis", extra={"error": str(e)}
-        )
-        return "error"
+    with tracer.start_as_current_span("quick_sentiment_check"):
+        try:
+            state = ctx.deps.get("state", {})
+            blob = TextBlob(feedback_text)
+            polarity = blob.sentiment.polarity
+            sentiment = (
+                "Positive"
+                if polarity > 0.2
+                else "Negative" if polarity < -0.2 else "Neutral"
+            )
+            state["sentiment"] = sentiment
+            return sentiment
+        except Exception as e:
+            uvicorn_logger.error(
+                "Error in quick sentiment analysis", extra={"error": str(e)}
+            )
+            return "error"
 
 
 # 2. follow up questions
 @feedback_agent.tool
 def ask_follow_up_question(ctx: RunContext, feedback_text: str) -> str:
     """Generates a clarifying question to get more detailed feedback."""
-    uvicorn_logger.info(" Generating follow-up question...")
-    name = ctx.deps.get("name", "the patient")
-    try:
-        response = client.chat.completions.create(
-            model="openai:gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"You're a helpful assistant trying to get more context from short or vague feedback from a patient named {name}.",
-                },
-                {
-                    "role": "user",
-                    "content": f"The feedback was: '{feedback_text}'. What follow-up question would you ask to understand it better?",
-                },
-            ],
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        uvicorn_logger.error(
-            "Error generating follow-up question", extra={"error": str(e)}
-        )
-        return "error"
+    with tracer.start_as_current_span("ask_follow_up_question"):
+        uvicorn_logger.info(" Generating follow-up question...")
+        name = ctx.deps.get("name", "the patient")
+        try:
+            response = client.chat.completions.create(
+                model="openai:gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": f"You're a helpful assistant trying to get more context from short or vague feedback from a patient named {name}.",
+                    },
+                    {
+                        "role": "user",
+                        "content": f"The feedback was: '{feedback_text}'. What follow-up question would you ask to understand it better?",
+                    },
+                ],
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            uvicorn_logger.error(
+                "Error generating follow-up question", extra={"error": str(e)}
+            )
+            return "error"
 
 
 # 3.start taking feedback
 @feedback_agent.tool
 def start_feedback_form_interaction(ctx: RunContext) -> str:
     """Initiates interactive feedback collection (satisfaction rating)."""
-    state = ctx.deps.get("state", {})
-    name = ctx.deps.get("name", "there")
+    with tracer.start_as_current_span("start_feedback_form_interaction"):
+        state = ctx.deps.get("state", {})
+        name = ctx.deps.get("name", "there")
 
-    # Check if feedback flow is already complete
-    if state.get("conversation_complete"):
-        return f"Thanks {name}, I've already collected your feedback. Is there anything else I can help you with?"
+        # ✅ Check if feedback flow is already complete
+        if state.get("conversation_complete"):
+            return f"Thanks {name}, I've already collected your feedback. Is there anything else I can help you with?"
 
-    # Prevent asking again if already rated
-    if state.get("satisfaction_rating"):
-        return f"Thanks {name}, I’ve already noted your rating of {state['satisfaction_rating']}."
+        # ✅ Prevent asking again if already rated
+        if state.get("satisfaction_rating"):
+            return f"Thanks {name}, I’ve already noted your rating of {state['satisfaction_rating']}."
 
-    state["awaiting_rating"] = True
-    return (
-        f"Alright {name}, I’d like to collect your feedback. "
-        "On a scale from 1 to 5, how would you rate your experience?"
-    )
+        state["awaiting_rating"] = True
+        return (
+            f"Alright {name}, I’d like to collect your feedback. "
+            "On a scale from 1 to 5, how would you rate your experience?"
+        )
 
 
 # 4.start taking feedback (part2)
 @feedback_agent.tool
 def ask_for_feedback_comments(ctx: RunContext) -> str:
     """Asks the user to describe their negative experience in detail."""
-    state = ctx.deps.get("state", {})
-    name = ctx.deps.get("name", "there")
+    with tracer.start_as_current_span("ask_for_feedback_comments"):
+        state = ctx.deps.get("state", {})
+        name = ctx.deps.get("name", "there")
 
-    # Check if feedback flow is already complete
-    if state.get("conversation_complete"):
-        return f"Thanks {name}, I've already collected your feedback. Is there anything else I can help you with?"
+        # Check if feedback flow is already complete
+        if state.get("conversation_complete"):
+            return f"Thanks {name}, I've already collected your feedback. Is there anything else I can help you with?"
 
-    if state.get("comments"):
-        return f"Thanks!, you've already shared your comments: \"{state['comments']}\"."
+        if state.get("comments"):
+            return f"Thanks!, you've already shared your comments: \"{state['comments']}\"."
 
-    rating = state.get("satisfaction_rating")
-    if not rating:
-        return f"Before we proceed, please let me know how you'd rate your experience on a scale of 1 to 5."
-    state["awaiting_comments"] = True
-    return (
-        f"Thanks for the rating, {name}. "
-        "Could you please describe what happened in a few words?"
-    )
+        rating = state.get("satisfaction_rating")
+        if not rating:
+            return f"Before we proceed, please let me know how you'd rate your experience on a scale of 1 to 5."
+        state["awaiting_comments"] = True
+        return (
+            f"Thanks for the rating, {name}. "
+            "Could you please describe what happened in a few words?"
+        )
 
 
 # 5. categorize the feedback comments of user
 @feedback_agent.tool
 def categorize_feedback(ctx: RunContext, comments: str) -> str:
     """Classifies feedback into predefined categories."""
-    uvicorn_logger.info(
-        "🔍 Categorizing feedback...", extra={"feedback_preview": comments[:50]}
-    )
-    start_time = time.time()
-    state = ctx.deps.get("state", {})
-    if state.get("category"):
-        return f"{state['category']}."
+    with tracer.start_as_current_span("categorize_feedback"):
+        uvicorn_logger.info(
+            "🔍 Categorizing feedback...", extra={"feedback_preview": comments[:50]}
+        )
+        start_time = time.time()
+        state = ctx.deps.get("state", {})
+        if state.get("category"):
+            return f"{state['category']}."
 
-    categories = {
-        "Billing": [
-            "bill",
-            "invoice",
-            "payment",
-            "charge",
-            "cost",
-            "expensive",
-            "insurance",
-            "price",
-        ],
-        "Staff": [
-            "nurse",
-            "doctor",
-            "receptionist",
-            "staff",
-            "employee",
-            "rude",
-            "friendly",
-            "helpful",
-        ],
-        "Wait Time": [
-            "wait",
-            "delay",
-            "hours",
-            "slow",
-            "time",
-            "appointment",
-            "queue",
-            "schedule",
-        ],
-        "Facilities": [
-            "clean",
-            "dirty",
-            "bathroom",
-            "room",
-            "bed",
-            "chair",
-            "building",
-            "parking",
-            "facility",
-            "environment",
-        ],
-        "Treatment": [
-            "medicine",
-            "procedure",
-            "treatment",
-            "diagnosis",
-            "prescription",
-            "care",
-            "pain",
-            "healing",
-        ],
-        "Communication": [
-            "explain",
-            "told",
-            "information",
-            "informed",
-            "understand",
-            "clarity",
-            "communication",
-        ],
-        "Other": [],
-    }
+        categories = {
+            "Billing": [
+                "bill",
+                "invoice",
+                "payment",
+                "charge",
+                "cost",
+                "expensive",
+                "insurance",
+                "price",
+                "refund",
+                "balance",
+                "copay",
+            ],
+            "Staff": [
+                "nurse",
+                "doctor",
+                "receptionist",
+                "staff",
+                "employee",
+                "rude",
+                "friendly",
+                "helpful",
+                "attitude",
+                "behavior",
+                "ignored",
+                "unprofessional",
+            ],
+            "Wait Time": [
+                "wait",
+                "delay",
+                "hours",
+                "slow",
+                "time",
+                "appointment",
+                "queue",
+                "schedule",
+                "reschedule",
+                "cancelled",
+                "overbooked",
+            ],
+            "Facilities": [
+                "clean",
+                "dirty",
+                "bathroom",
+                "room",
+                "bed",
+                "chair",
+                "building",
+                "parking",
+                "facility",
+                "environment",
+                "noise",
+                "unclean",
+                "equipment",
+                "infrastructure",
+            ],
+            "Treatment": [
+                "medicine",
+                "procedure",
+                "treatment",
+                "diagnosis",
+                "prescription",
+                "care",
+                "pain",
+                "healing",
+                "operation",
+                "surgery",
+                "injection",
+                "therapy",
+                "misdiagnosed",
+            ],
+            "Communication": [
+                "explain",
+                "told",
+                "information",
+                "informed",
+                "understand",
+                "clarity",
+                "communication",
+                "confused",
+                "instructions",
+                "language",
+            ],
+            "Other": [],
+        }
 
-    feedback_lower = comments.lower()
-    match_counts = {
-        category: sum(keyword in feedback_lower for keyword in keywords)
-        for category, keywords in categories.items()
-    }
+        feedback_lower = comments.lower()
+        match_counts = {
+            category: sum(keyword in feedback_lower for keyword in keywords)
+            for category, keywords in categories.items()
+        }
 
-    best_category = max(match_counts.items(), key=lambda x: x[1])[0]
-    if match_counts[best_category] == 0:
-        best_category = "Other"
+        best_category = max(match_counts.items(), key=lambda x: x[1])[0]
+        if match_counts[best_category] == 0:
+            best_category = "Other"
 
-    uvicorn_logger.info(
-        "Categorization done",
-        extra={"category": best_category, "time": f"{time.time() - start_time:.2f}s"},
-    )
+        uvicorn_logger.info(
+            "✅ Categorization done",
+            extra={
+                "category": best_category,
+                "time": f"{time.time() - start_time:.2f}s",
+            },
+        )
 
-    state["category"] = best_category
-    return best_category
+        state["category"] = best_category
+        return best_category
 
 
 # 6. save the data to db
 @feedback_agent.tool
 def save_feedback_to_database(ctx: RunContext) -> str:
     """Saves structured feedback into MongoDB from the context."""
-    try:
-        state = ctx.deps.get("state", {})
-        name = ctx.deps.get("name")
-        nhs_number = ctx.deps.get("nhs_number")
-        rating = state.get("satisfaction_rating")
-        comments = state.get("comments")
-        category = state.get("category")
+    with tracer.start_as_current_span("save_feedback_to_database"):
+        try:
+            state = ctx.deps.get("state", {})
+            name = ctx.deps.get("name")
+            nhs_number = ctx.deps.get("nhs_number")
+            rating = state.get("satisfaction_rating")
+            comments = state.get("comments")
+            category = state.get("category")
 
-        if not all([name, nhs_number, rating, comments]):
-            return "⚠Some required fields (name, rating, or comments) are missing. Please complete the feedback."
+            if not all([name, nhs_number, rating, comments]):
+                return "⚠️ Some required fields (name, rating, or comments) are missing. Please complete the feedback."
 
-        category = categorize_feedback(ctx, comments)
+            category = categorize_feedback(ctx, comments)
 
-        feedback_doc = {
-            "patient_name": name,
-            "nhs_number": nhs_number,
-            "satisfaction_rating": int(rating),
-            "comments": comments,
-            "category": category,
-        }
+            feedback_doc = {
+                "patient_name": name,
+                "nhs_number": nhs_number,
+                "satisfaction_rating": int(rating),
+                "comments": comments,
+                "category": category,
+            }
 
-        feedback_collection.insert_one(feedback_doc)
-        state["feedback_saved"] = True
-        # Mark the conversation as complete after saving feedback
-        state["conversation_complete"] = True
+            feedback_collection.insert_one(feedback_doc)
+            state["feedback_saved"] = True
+            # Mark the conversation as complete after saving feedback
+            state["conversation_complete"] = True
+            # 🔔 Trigger Slack alert for critical issues
+            scan_critical_issues_and_alert()
 
-        return f"✅ Thanks {name}, your feedback has been saved. We’ll use this to improve our service!"
-    except Exception as e:
-        return f"❌ Error saving feedback: {str(e)}"
+            return f"✅ Thanks {name}, your feedback has been saved. We’ll use this to improve our service!"
+        except Exception as e:
+            return f"❌ Error saving feedback: {str(e)}"
 
 
-# 4 Identify Recurring Issues
+# 4️ Identify Recurring Issues
 @feedback_agent.tool
 def find_common_issues(ctx: RunContext) -> list:
     """Returns top recurring issues based on feedback comment keywords."""
-    name = ctx.deps.get("name", "there")
-    state = ctx.deps.get("state", {})
-    all_feedback = feedback_collection.find()
-    all_comments = " ".join(f.get("comments", "") for f in all_feedback).lower()
+    with tracer.start_as_current_span("find_common_issues"):
+        name = ctx.deps.get("name", "there")
+        state = ctx.deps.get("state", {})
+        all_feedback = feedback_collection.find()
+        all_comments = " ".join(f.get("comments", "") for f in all_feedback).lower()
 
-    issue_keywords = {
-        "wait": "Long waiting times",
-        "delay": "Long waiting times",
-        "hours": "Long waiting times",
-        "billing": "Billing and insurance issues",
-        "bill": "Billing and insurance issues",
-        "insurance": "Billing and insurance issues",
-        "payment": "Billing and insurance issues",
-        "rude": "Staff communication and attitude concerns",
-        "attitude": "Staff communication and attitude concerns",
-        "communication": "Staff communication and attitude concerns",
-        "cleanliness": "Facility cleanliness and comfort",
-        "dirty": "Facility cleanliness and comfort",
-        "clean": "Facility cleanliness and comfort",
-        "explain": "Lack of clear medical explanations",
-        "understanding": "Lack of clear medical explanations",
-        "information": "Lack of clear medical explanations",
-        "parking": "Parking and accessibility issues",
-        "access": "Parking and accessibility issues",
-    }
+        issue_keywords = {
+            "wait": "Long waiting times",
+            "delay": "Long waiting times",
+            "hours": "Long waiting times",
+            "billing": "Billing and insurance issues",
+            "bill": "Billing and insurance issues",
+            "insurance": "Billing and insurance issues",
+            "payment": "Billing and insurance issues",
+            "rude": "Staff communication and attitude concerns",
+            "attitude": "Staff communication and attitude concerns",
+            "communication": "Staff communication and attitude concerns",
+            "cleanliness": "Facility cleanliness and comfort",
+            "dirty": "Facility cleanliness and comfort",
+            "clean": "Facility cleanliness and comfort",
+            "explain": "Lack of clear medical explanations",
+            "understanding": "Lack of clear medical explanations",
+            "information": "Lack of clear medical explanations",
+            "parking": "Parking and accessibility issues",
+            "access": "Parking and accessibility issues",
+            "noise": "Noise and disturbances",
+            "unclean": "Facility cleanliness and comfort",
+            "lost": "Lost belongings",
+            "confused": "Disorganized patient experience",
+            "forgot": "Missed care or checkups",
+            "cancelled": "Cancelled appointments",
+            "reschedule": "Scheduling difficulties",
+            "wrong": "Incorrect treatment or handling",
+            "shortage": "Staff or resource shortages",
+            "infection": "Hygiene and infection concerns",
+            "overbooked": "Overcrowding and delay",
+            "discharge": "Discharge process delays",
+            "equipment": "Equipment malfunction or availability",
+            "ignored": "Neglect or dismissal of concerns",
+            "unattended": "Neglect or delayed attention",
+        }
 
-    issue_counts = {}
-    for keyword, description in issue_keywords.items():
-        count = all_comments.count(keyword)
-        if description in issue_counts:
-            issue_counts[description] += count
-        else:
-            issue_counts[description] = count
+        issue_counts = {}
+        for keyword, description in issue_keywords.items():
+            count = all_comments.count(keyword)
+            if description in issue_counts:
+                issue_counts[description] += count
+            else:
+                issue_counts[description] = count
 
-    top_issues = sorted(issue_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-    if not top_issues:
-        return [f"No common issues found, {name}."]
+        top_issues = sorted(issue_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+        if not top_issues:
+            return [f"No common issues found, {name}."]
 
-    # Set conversation as completed once we reach this step
-    state["conversation_complete"] = True
+        # Set conversation as completed once we reach this step
+        state["conversation_complete"] = True
 
-    return [f"• {desc} ({count} mentions)" for desc, count in top_issues]
+        return [f"• {desc} ({count} mentions)" for desc, count in top_issues]
 
 
 # NEW TOOL: Handle general responses after feedback is complete
 @feedback_agent.tool
 def handle_general_response(ctx: RunContext, message: str) -> str:
     """Handles general responses after the feedback collection is complete."""
-    state = ctx.deps.get("state", {})
-    name = ctx.deps.get("name", "there")
+    with tracer.start_as_current_span("handle_general_response"):
+        state = ctx.deps.get("state", {})
+        name = ctx.deps.get("name", "there")
 
-    if not state.get("feedback_saved"):
-        return None
+        if not state.get("feedback_saved"):
+            return None
 
-    gratitude_keywords = [
-        "thank",
-        "thanks",
-        "thx",
-        "appreciate",
-        "grateful",
-        "thankyou",
-        "Thank you",
-    ]
-    if any(keyword in message.lower() for keyword in gratitude_keywords):
-        return f"You're welcome, {name}! Your feedback helps us improve our services. If you have any other questions or concerns in the future, please don't hesitate to reach out."
+        gratitude_keywords = [
+            "thank",
+            "thanks",
+            "thx",
+            "appreciate",
+            "grateful",
+            "thankyou",
+            "Thank you",
+        ]
+        if any(keyword in message.lower() for keyword in gratitude_keywords):
+            return f"You're welcome, {name}! Your feedback helps us improve our services. If you have any other questions or concerns in the future, please don't hesitate to reach out."
 
-    goodbye_keywords = ["bye", "goodbye", "see you", "farewell"]
-    if any(keyword in message.lower() for keyword in goodbye_keywords):
-        return f"Goodbye, {name}! Thank you for your time and feedback. Have a wonderful day!"
+        goodbye_keywords = ["bye", "goodbye", "see you", "farewell"]
+        if any(keyword in message.lower() for keyword in goodbye_keywords):
+            return f"Goodbye, {name}! Thank you for your time and feedback. Have a wonderful day!"
 
-    # Handle general follow-up
-    return f"Thank you for your engagement, {name}. Your feedback has been recorded. Is there anything else you'd like to discuss about our healthcare services?"
+        # Handle general follow-up
+        return f"Thank you for your engagement, {name}. Your feedback has been recorded. Is there anything else you'd like to discuss about our healthcare services?"
 
 
-# 5 Trend Analysis
+# 5️ Trend Analysis
 @feedback_agent.tool
 def generate_trend_analysis(ctx: RunContext) -> str:
     """Generates a summary report of feedback trends."""
-    feedback_docs = list(feedback_collection.find())
-    name = ctx.deps.get("name", "there")
+    with tracer.start_as_current_span("generate_trend_analysis"):
+        feedback_docs = list(feedback_collection.find())
+        name = ctx.deps.get("name", "there")
 
-    if not feedback_docs:
-        return f"No feedback records found yet, {name}."
+        if not feedback_docs:
+            return f"No feedback records found yet, {name}."
 
-    # 1. Satisfaction ratings
-    ratings = [
-        f["satisfaction_rating"] for f in feedback_docs if "satisfaction_rating" in f
-    ]
-    avg_rating = sum(ratings) / len(ratings)
+        # 1. Satisfaction ratings
+        ratings = [
+            f["satisfaction_rating"]
+            for f in feedback_docs
+            if "satisfaction_rating" in f
+        ]
+        avg_rating = sum(ratings) / len(ratings)
 
-    # 2. Rating distribution
-    rating_distribution = {i: ratings.count(i) for i in range(1, 6)}
+        # 2. Rating distribution
+        rating_distribution = {i: ratings.count(i) for i in range(1, 6)}
 
-    # 3. Category analysis
-    categories = [f.get("category", "Unknown") for f in feedback_docs]
-    category_counts = {}
-    for cat in categories:
-        category_counts[cat] = category_counts.get(cat, 0) + 1
-    top_category = max(category_counts.items(), key=lambda x: x[1])[0]
+        # 3. Category analysis
+        categories = [f.get("category", "Unknown") for f in feedback_docs]
+        category_counts = {}
+        for cat in categories:
+            category_counts[cat] = category_counts.get(cat, 0) + 1
+        top_category = max(category_counts.items(), key=lambda x: x[1])[0]
 
-    # Format report
-    report = (
-        f"📊 **Feedback Trend Summary for {name}:**\n"
-        f"• Total feedback received: {len(ratings)}\n"
-        f"• Average satisfaction rating: {avg_rating:.2f}/5\n"
-        f"• Most discussed category: {top_category}\n"
-        f"• Rating distribution:\n"
-    )
-    for rating, count in rating_distribution.items():
-        report += f"   - {rating}: {count}\n"
+        # Format report
+        report = (
+            f"📊 **Feedback Trend Summary for {name}:**\n"
+            f"• Total feedback received: {len(ratings)}\n"
+            f"• Average satisfaction rating: {avg_rating:.2f}/5\n"
+            f"• Most discussed category: {top_category}\n"
+            f"• Rating distribution:\n"
+        )
+        for rating, count in rating_distribution.items():
+            report += f"   - {rating}: {count}\n"
 
-    return report
-
-
-# 6 Critical Issue Alerts
-@feedback_agent.tool
-def detect_critical_issues(ctx: RunContext) -> list:
-    """Scans comments for critical incidents and alerts."""
-    name = ctx.deps.get("name", "there")
-
-    critical_keywords = {
-        "emergency": "Emergency response concerns",
-        "died": "Potential mortality incident",
-        "death": "Potential mortality incident",
-        "mistake": "Potential medical error",
-        "error": "Potential medical error",
-        "wrong medication": "Medication error",
-        "wrong medicine": "Medication error",
-        "allergic reaction": "Adverse reaction",
-        "fall": "Patient safety incident",
-        "fell": "Patient safety incident",
-        "infection": "Infection control issue",
-        "contamination": "Infection control issue",
-        "unsanitary": "Infection control issue",
-        "neglect": "Patient neglect concern",
-        "ignored": "Patient neglect concern",
-        "lawsuit": "Legal concern raised",
-        "sue": "Legal concern raised",
-        "legal": "Legal concern raised",
-    }
-
-    critical_issues = []
-    for feedback in feedback_collection.find():
-        comment = feedback.get("comments", "").lower()
-        nhs = feedback.get("nhs_number", "unknown")
-
-        for keyword, description in critical_keywords.items():
-            if keyword in comment:
-                critical_issues.append(f"⚠️ {description} reported (NHS: {nhs})")
-
-    if not critical_issues:
-        return [f"No critical issues detected at the moment, {name}."]
-    return critical_issues
+        return report
 
 
 # 7. Check conversation state to determine if we need to start a new feedback flow
 @feedback_agent.tool
 def check_conversation_state(ctx: RunContext) -> str:
     """Checks the current state of the conversation to determine next actions."""
-    state = ctx.deps.get("state", {})
-    name = ctx.deps.get("name", "there")
+    with tracer.start_as_current_span("check_conversation_state"):
+        state = ctx.deps.get("state", {})
+        name = ctx.deps.get("name", "there")
 
-    # If we've already completed the feedback flow
-    if state.get("conversation_complete"):
-        return f"feedback_flow_complete"
+        # If we've already completed the feedback flow
+        if state.get("conversation_complete"):
+            return f"feedback_flow_complete"
 
-    # If we're in the middle of the feedback flow
-    if state.get("awaiting_rating"):
-        return "awaiting_rating"
-    elif state.get("awaiting_comments"):
-        return "awaiting_comments"
-    elif state.get("feedback_saved"):
-        return "feedback_saved"
+        # If we're in the middle of the feedback flow
+        if state.get("awaiting_rating"):
+            return "awaiting_rating"
+        elif state.get("awaiting_comments"):
+            return "awaiting_comments"
+        elif state.get("feedback_saved"):
+            return "feedback_saved"
 
-    # Default - new conversation
-    return "new_conversation"
+        # Default - new conversation
+        return "new_conversation"
 
 
 # Function to run the agent
@@ -567,3 +586,47 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# # 6️ Critical Issue Alerts
+# @feedback_agent.tool
+# def detect_critical_issues(ctx: RunContext) -> list:
+#     """Scans comments for critical incidents and alerts."""
+#     with tracer.start_as_current_span("detect_critical_issues"):
+#         name = ctx.deps.get("name", "there")
+
+#         critical_keywords = {
+#             "emergency": "Emergency response concerns",
+#             "died": "Potential mortality incident",
+#             "death": "Potential mortality incident",
+#             "mistake": "Potential medical error",
+#             "error": "Potential medical error",
+#             "wrong medication": "Medication error",
+#             "wrong medicine": "Medication error",
+#             "allergic reaction": "Adverse reaction",
+#             "fall": "Patient safety incident",
+#             "fell": "Patient safety incident",
+#             "infection": "Infection control issue",
+#             "contamination": "Infection control issue",
+#             "unsanitary": "Infection control issue",
+#             "neglect": "Patient neglect concern",
+#             "ignored": "Patient neglect concern",
+#             "lawsuit": "Legal concern raised",
+#             "sue": "Legal concern raised",
+#             "legal": "Legal concern raised",
+#             "Blood": "Blood urgency or lack of Blood",
+#             "urgent": "Immediate action or medication",
+#         }
+
+#         critical_issues = []
+#         for feedback in feedback_collection.find():
+#             comment = feedback.get("comments", "").lower()
+#             nhs = feedback.get("nhs_number", "unknown")
+
+#             for keyword, description in critical_keywords.items():
+#                 if keyword in comment:
+#                     critical_issues.append(f"⚠️ {description} reported (NHS: {nhs})")
+
+#         if not critical_issues:
+#             return [f"No critical issues detected at the moment, {name}."]
+#         return critical_issues
