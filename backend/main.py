@@ -1,12 +1,28 @@
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket, Request
 from models import RegisterRequest, LoginRequest
-from database import users_collection
+from database import users_collection, feedback_collection
 from fastapi.middleware.cors import CORSMiddleware
 from ai_agent import feedback_agent
 import json
 from pydantic_ai import RunContext
+import hmac, hashlib, os, time, json
+from starlette.responses import JSONResponse
+from slack_sdk.web import WebClient
+from bson.objectid import ObjectId
+from otel_setup import setup_otel
+from opentelemetry import trace
+from scheduler import start_scheduler
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
+setup_otel(app)
+start_scheduler()
+
+
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,6 +45,67 @@ VALID_NHS_NUMBERS = {
         "health_issue": "Leg Fracture",
     },
 }
+
+@app.post("/slack/actions")
+async def slack_actions(request: Request):
+    # 1. Validate Slack signature
+    body = await request.body()
+    timestamp = request.headers.get("X-Slack-Request-Timestamp")
+    slack_signature = request.headers.get("X-Slack-Signature")
+
+    if abs(time.time() - int(timestamp)) > 60 * 5:
+        raise HTTPException(status_code=403, detail="Request too old")
+
+    sig_basestring = f"v0:{timestamp}:{body.decode('utf-8')}"
+    my_signature = (
+        "v0="
+        + hmac.new(
+            SLACK_SIGNING_SECRET.encode(), sig_basestring.encode(), hashlib.sha256
+        ).hexdigest()
+    )
+
+    if not hmac.compare_digest(my_signature, slack_signature):
+        raise HTTPException(status_code=403, detail="Invalid Slack signature")
+
+    # 2. Parse the action payload
+    form_data = await request.form()
+    payload = json.loads(form_data["payload"])
+    action_id = payload["actions"][0]["action_id"]
+    feedback_id = payload["actions"][0]["value"]
+    channel_id = payload["channel"]["id"]
+    user = payload["user"]["username"]
+
+    # 3. Handle actions
+    if action_id == "acknowledge_alert":
+        result = feedback_collection.update_one(
+            {"_id": ObjectId(feedback_id)}, {"$set": {"alert_acknowledged": True}}
+        )
+        slack_client.chat_postMessage(
+            channel=channel_id,
+            text=f"✅ *{user}* acknowledged alert for feedback `{feedback_id}`",
+        )
+
+    elif action_id == "view_patient":
+        feedback = feedback_collection.find_one({"_id": ObjectId(feedback_id)})
+        if not feedback:
+            slack_client.chat_postMessage(
+                channel=channel_id, text="❌ Feedback not found."
+            )
+            return JSONResponse({"ok": True})
+
+        msg = (
+            f"*Patient:* {feedback.get('patient_name', 'Unknown')}\n"
+            f"*NHS Number:* {feedback.get('nhs_number', 'Unknown')}\n"
+            f"*Rating:* {feedback.get('satisfaction_rating', 'N/A')}/5\n"
+            f"*Issue:* {feedback.get('comments', '')}\n"
+            f"*Category:* {feedback.get('category', 'N/A')}"
+        )
+
+        slack_client.chat_postMessage(
+            channel=channel_id, text=f"👤 Patient Details:\n{msg}"
+        )
+
+    return JSONResponse(content={"ok": True}, status_code=200)
 
 
 @app.websocket("/ws")
