@@ -3,7 +3,6 @@
 from database import feedback_collection, alerted_feedbacks
 from alerts import send_slack_alert
 from bson.objectid import ObjectId
-from datetime import datetime
 
 
 def scan_critical_issues_and_alert():
@@ -45,39 +44,17 @@ def scan_critical_issues_and_alert():
     }
 
     critical_issues = []
-    alerted_feedback_ids = set(
-        str(entry["feedback_id"]) for entry in alerted_feedbacks.find()
-    )
-
     for feedback in feedback_collection.find():
-        feedback_id = str(feedback.get("_id"))
-        nhs = feedback.get("nhs_number", "unknown")
         comment = feedback.get("comments", "").lower()
+        nhs = feedback.get("nhs_number", "unknown")
 
-        if feedback_id in alerted_feedback_ids:
-            continue  # already alerted, skip
-
-        matched_keywords = [
-            keyword for keyword in critical_keywords if keyword in comment
-        ]
-
-        if matched_keywords:
-            for keyword in matched_keywords:
-                description = critical_keywords[keyword]
-                critical_issues.append(f"⚠️ {description} reported (NHS: {nhs})")
-
-            # Save to cache to avoid re-alerting
-            alerted_feedbacks.insert_one(
-                {
-                    "feedback_id": ObjectId(feedback_id),
-                    "nhs_number": nhs,
-                    "alerted_keywords": matched_keywords,
-                    "alerted_at": datetime.utcnow(),
-                }
-            )
+        for keyword, description in critical_keywords.items():
+            if keyword in comment:
+                issue_msg = f"⚠️ {description} reported (NHS: {nhs})"
+                critical_issues.append(issue_msg)
 
     if critical_issues:
-        alert_msg = "*🚨 New Critical Patient Issues Detected:*\n" + "\n".join(
+        alert_msg = "*🚨 Critical Patient Issues Detected:*\n" + "\n".join(
             critical_issues[:3]
-        )  # Limit
+        )  # Limit to top 5
         send_slack_alert(alert_msg)
