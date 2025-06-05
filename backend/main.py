@@ -13,6 +13,7 @@ from otel_setup import setup_otel
 from opentelemetry import trace
 from scheduler import start_scheduler
 from dotenv import load_dotenv
+from datetime import datetime
 
 load_dotenv()
 
@@ -23,6 +24,7 @@ start_scheduler()
 
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 slack_client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,7 +46,20 @@ VALID_NHS_NUMBERS = {
         "date_of_treatment": "2025-04-26",
         "health_issue": "Leg Fracture",
     },
+    "1234567892": {
+        "age": 21,
+        "gender": "Male",
+        "date_of_treatment": "2025-05-02",
+        "health_issue": "Gut issues",
+    },
+    "1234567893": {
+        "age": 35,
+        "gender": "Female",
+        "date_of_treatment": "2025-05-10",
+        "health_issue": "Chest pain",
+    },
 }
+
 
 @app.post("/slack/actions")
 async def slack_actions(request: Request):
@@ -91,21 +106,41 @@ async def slack_actions(request: Request):
             slack_client.chat_postMessage(
                 channel=channel_id, text="❌ Feedback not found."
             )
-            return JSONResponse({"ok": True})
+            return JSONResponse(content={"ok": True}, status_code=200)
 
+        nhs_number = feedback.get("nhs_number")
+        user = users_collection.find_one({"nhs number.number": nhs_number})
+        nhs_data = user.get("nhs number", {})
+
+        if not user:
+            slack_client.chat_postMessage(
+                channel=channel_id, text=f"❌ Patient not found for NHS: {nhs_number}"
+            )
+            return JSONResponse(content={"ok": True}, status_code=200)
+
+        feedback_time = feedback["_id"].generation_time.strftime("%Y-%m-%d %H:%M:%S")
+        treatment_date = user.get("date_of_treatment", "N/A")
+
+        # Build detailed message
         msg = (
-            f"*Patient:* {feedback.get('patient_name', 'Unknown')}\n"
-            f"*NHS Number:* {feedback.get('nhs_number', 'Unknown')}\n"
-            f"*Rating:* {feedback.get('satisfaction_rating', 'N/A')}/5\n"
-            f"*Issue:* {feedback.get('comments', '')}\n"
-            f"*Category:* {feedback.get('category', 'N/A')}"
+            f"*👤 Patient Details:*\n"
+            f"> *Name:* {user.get('name', 'Unknown')}\n"
+            f"> *NHS Number:* {nhs_number}\n"
+            f"> *Age:* {nhs_data.get('age', 'N/A')}\n"
+            f"> *Gender:* {nhs_data.get('gender', 'N/A')}\n"
+            f"> *Health Issue:* {nhs_data.get('health_issue', 'N/A')}\n"
+            f"> *Date of Treatment:* {nhs_data.get('date_of_treatment', 'N/A')}\n"
+            f"*📝 Feedback Details:*\n"
+            f"> *Submitted On:* {feedback_time}\n"
+            f"> *Rating:* {feedback.get('satisfaction_rating', 'N/A')}/5\n"
+            f"> *Category:* {feedback.get('category', 'N/A')}\n"
+            f"> *Comment:* {feedback.get('comments', 'N/A')}"
         )
 
-        slack_client.chat_postMessage(
-            channel=channel_id, text=f"👤 Patient Details:\n{msg}"
-        )
+        slack_client.chat_postMessage(channel=channel_id, text=msg)
 
-    return JSONResponse(content={"ok": True}, status_code=200)
+        return JSONResponse(content={"ok": True}, status_code=200)
+
 
 
 @app.websocket("/ws")
