@@ -43,18 +43,10 @@ def scan_critical_issues_and_alert():
         "oxygen problem": "Oxygen supply issue",
     }
 
-    critical_issues = []
-    for feedback in feedback_collection.find():
+    for feedback in feedback_collection.find({"alert_acknowledged": {"$ne": True}}):
         comment = feedback.get("comments", "").lower()
-        nhs = feedback.get("nhs_number", "unknown")
+        matched_keyword = next((k for k in critical_keywords if k in comment), None)
 
-        for keyword, description in critical_keywords.items():
-            if keyword in comment:
-                issue_msg = f"⚠️ {description} reported (NHS: {nhs})"
-                critical_issues.append(issue_msg)
-
-    if critical_issues:
-        alert_msg = "*🚨 Critical Patient Issues Detected:*\n" + "\n".join(
-            critical_issues[:3]
-        )  # Limit to top 5
-        send_slack_alert(alert_msg)
+        if matched_keyword:
+            description = critical_keywords[matched_keyword]
+            send_slack_alert_with_buttons(feedback, description)
