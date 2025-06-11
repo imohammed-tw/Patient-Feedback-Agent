@@ -17,6 +17,9 @@ export default function AgentPage() {
   const [showProfileTooltip, setShowProfileTooltip] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef(null);
+  const [notifications, setNotifications] = useState([]);
+  const [showNotifications, setShowNotifications] = useState(false);
+
 
   useEffect(() => {
     const ws = new WebSocket("ws://localhost:8000/ws");
@@ -62,6 +65,38 @@ export default function AgentPage() {
     window.location.href = "/";
   };
 
+  const fetchNotifications = async () => {
+    const user = JSON.parse(localStorage.getItem("user"));
+    if (!user?.nhsNumber) return;
+  
+    try {
+      const res = await fetch(`http://localhost:8000/notifications/${user.nhsNumber}`);
+      const data = await res.json();
+      setNotifications(data.notifications || []);
+      setShowNotifications(!showNotifications);  // toggle popup
+    } catch (err) {
+      console.error("Error fetching notifications:", err);
+    }
+  };
+
+  const markAllAsRead = async () => {
+    const user = JSON.parse(localStorage.getItem("user"));
+    if (!user?.nhsNumber) return;
+  
+    try {
+      await fetch(`http://localhost:8000/notifications/mark-read/${user.nhsNumber}`, {
+        method: "POST"
+      });
+  
+      // Re-fetch updated notifications
+      fetchNotifications();
+    } catch (err) {
+      console.error("Error marking notifications as read:", err);
+    }
+  };
+  
+  
+
   const handleNewChat = () => {
   // Logic to start a new chat goes here
   setMessages([]);
@@ -94,6 +129,60 @@ export default function AgentPage() {
               </div>
             )}
             </div>
+
+            <div className="relative">
+    <button onClick={fetchNotifications}>
+      <span className="relative">
+        <span className="absolute -top-2 -right-2 bg-red-600 text-white text-xs rounded-full px-1.5 py-0.5">
+          {notifications.length}
+        </span>
+        <svg
+          className="w-6 h-6 text-white hover:text-blue-400 cursor-pointer"
+          fill="none"
+          viewBox="0 0 24 24"
+          stroke="currentColor"
+        >
+          <path d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11c0-3.314-2.686-6-6-6S6 7.686 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
+        </svg>
+      </span>
+    </button>
+
+    {/* 🔔 Dropdown */}
+    {showNotifications && (
+      <div className="absolute right-0 top-8 w-80 bg-gray-800 rounded shadow-lg text-sm z-50 max-h-96 overflow-y-auto p-3 border border-gray-600">
+        <h4 className="text-white font-semibold mb-2">Notifications</h4>
+        <button
+          onClick={markAllAsRead}
+          className="text-xs text-blue-400 hover:underline"
+        >
+          Mark all as read
+        </button>
+        {notifications.length === 0 ? (
+          <p className="text-gray-400">No notifications yet.</p>
+        ) : (
+          notifications.map((n, i) => (
+            <div key={i} className="mb-3 p-2 bg-gray-700 rounded">
+              <p className={`font-semibold ${n.type === 'rejected' ? 'text-red-400' : 'text-green-400'}`}>
+                {n.type === "rejected" ? "❌ Rejected" : "✅ Acknowledged"}
+              </p>
+              <p className="text-gray-300 text-sm mt-1">{n.message}</p>
+              {n.feedback?.comment && (
+              <p className="text-gray-400 text-xs mt-1">💬 "{n.feedback.comment}"</p>
+            )}
+            
+            {n.note && (
+              <p className="text-red-300 text-xs mt-1 italic">📝 Note: {n.note}</p>
+            )}
+              <p className="text-gray-500 text-xs mt-1">
+                {new Date(n.timestamp).toLocaleString()}
+              </p>
+            </div>
+          ))
+        )}
+      </div>
+      )}
+  </div>
+
           <Cog6ToothIcon 
             className="w-6 h-6 cursor-pointer hover:text-blue-400"
             onClick={() => setShowDropdown(!showDropdown)}
