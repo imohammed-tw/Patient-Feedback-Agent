@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, WebSocket, Request
+from fastapi import FastAPI, HTTPException, WebSocket, Request, APIRouter
 from models import RegisterRequest, LoginRequest
 from database import users_collection, feedback_collection
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,9 +61,9 @@ VALID_NHS_NUMBERS = {
 }
 
 
-@app.post("/slack/actions")
-async def slack_actions(request: Request):
-    # 1. Validate Slack signature
+@app.post("/slack/interaction")
+async def slack_interaction_handler(request: Request):
+    # ✅ 1. Signature validation
     body = await request.body()
     timestamp = request.headers.get("X-Slack-Request-Timestamp")
     slack_signature = request.headers.get("X-Slack-Signature")
@@ -82,65 +82,220 @@ async def slack_actions(request: Request):
     if not hmac.compare_digest(my_signature, slack_signature):
         raise HTTPException(status_code=403, detail="Invalid Slack signature")
 
-    # 2. Parse the action payload
+    # ✅ 2. Parse payload
     form_data = await request.form()
     payload = json.loads(form_data["payload"])
-    action_id = payload["actions"][0]["action_id"]
-    feedback_id = payload["actions"][0]["value"]
-    channel_id = payload["channel"]["id"]
-    user = payload["user"]["username"]
+    payload_type = payload.get("type")
 
-    # 3. Handle actions
-    if action_id == "acknowledge_alert":
-        result = feedback_collection.update_one(
-            {"_id": ObjectId(feedback_id)}, {"$set": {"alert_acknowledged": True}}
-        )
-        slack_client.chat_postMessage(
-            channel=channel_id,
-            text=f"✅ *{user}* acknowledged alert for feedback `{feedback_id}`",
-        )
+    if payload_type == "block_actions":
+        action_id = payload["actions"][0]["action_id"]
+        feedback_id = payload["actions"][0]["value"]
+        channel_id = payload["channel"]["id"]
+        user = payload["user"]["username"]
 
-    elif action_id == "view_patient":
         feedback = feedback_collection.find_one({"_id": ObjectId(feedback_id)})
         if not feedback:
             slack_client.chat_postMessage(
                 channel=channel_id, text="❌ Feedback not found."
             )
-            return JSONResponse(content={"ok": True}, status_code=200)
+            return JSONResponse(content={"ok": True})
 
-        nhs_number = feedback.get("nhs_number")
-        user = users_collection.find_one({"nhs number.number": nhs_number})
-        nhs_data = user.get("nhs number", {})
+        nhs_number = feedback.get("nhs_number", "unknown")
+        user_doc = users_collection.find_one({"nhs number.number": nhs_number})
+        nhs_data = user_doc.get("nhs number", {}) if user_doc else {}
 
-        if not user:
-            slack_client.chat_postMessage(
-                channel=channel_id, text=f"❌ Patient not found for NHS: {nhs_number}"
+        if action_id == "acknowledge_alert":
+            feedback_collection.update_one(
+                {"_id": ObjectId(feedback_id)}, {"$set": {"alert_acknowledged": True}}
             )
-            return JSONResponse(content={"ok": True}, status_code=200)
 
-        feedback_time = feedback["_id"].generation_time.strftime("%Y-%m-%d %H:%M:%S")
-        treatment_date = user.get("date_of_treatment", "N/A")
+            notifications_collection.insert_one(
+                {
+                    "nhs_number": nhs_number,
+                    "type": "acknowledged",
+                    "message": "Your feedback was reviewed and acknowledged by the admin.",
+                    "timestamp": datetime.utcnow(),
+                    "read": False,
+                    "feedback": {
+                        "comment": feedback.get("comments"),
+                        "category": feedback.get("category"),
+                        "rating": feedback.get("satisfaction_rating"),
+                    },
+                }
+            )
 
-        # Build detailed message
-        msg = (
-            f"*👤 Patient Details:*\n"
-            f"> *Name:* {user.get('name', 'Unknown')}\n"
-            f"> *NHS Number:* {nhs_number}\n"
-            f"> *Age:* {nhs_data.get('age', 'N/A')}\n"
-            f"> *Gender:* {nhs_data.get('gender', 'N/A')}\n"
-            f"> *Health Issue:* {nhs_data.get('health_issue', 'N/A')}\n"
-            f"> *Date of Treatment:* {nhs_data.get('date_of_treatment', 'N/A')}\n"
-            f"*📝 Feedback Details:*\n"
-            f"> *Submitted On:* {feedback_time}\n"
-            f"> *Rating:* {feedback.get('satisfaction_rating', 'N/A')}/5\n"
-            f"> *Category:* {feedback.get('category', 'N/A')}\n"
-            f"> *Comment:* {feedback.get('comments', 'N/A')}"
+            # Update original message to disable buttons
+            slack_client.chat_update(
+                channel=channel_id,
+                ts=payload["message"]["ts"],
+                text="✅ Feedback acknowledged",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"✅ *{user}* acknowledged this feedback alert.",
+                        },
+                    }
+                ],
+            )
+
+            slack_client.chat_postMessage(
+                channel=channel_id,
+                text=f"✅ *{user}* acknowledged alert for feedback `{feedback_id}`",
+            )
+
+        elif action_id == "view_patient":
+            if not user_doc:
+                slack_client.chat_postMessage(
+                    channel=channel_id, text="❌ Patient not found."
+                )
+                return JSONResponse(content={"ok": True})
+
+            feedback_time = feedback["_id"].generation_time.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+            msg = (
+                f"*👤 Patient Details:*\n"
+                f"> *Name:* {user_doc.get('name', 'Unknown')}\n"
+                f"> *NHS Number:* {nhs_number}\n"
+                f"> *Age:* {nhs_data.get('age', 'N/A')}\n"
+                f"> *Gender:* {nhs_data.get('gender', 'N/A')}\n"
+                f"> *Health Issue:* {nhs_data.get('health_issue', 'N/A')}\n"
+                f"> *Date of Treatment:* {nhs_data.get('date_of_treatment', 'N/A')}\n\n"
+                f"*📝 Feedback Details:*\n"
+                f"> *Submitted On:* {feedback_time}\n"
+                f"> *Rating:* {feedback.get('satisfaction_rating', 'N/A')}/5\n"
+                f"> *Category:* {feedback.get('category', 'N/A')}\n"
+                f"> *Comment:* {feedback.get('comments', 'N/A')}"
+            )
+
+            slack_client.chat_postMessage(channel=channel_id, text=msg)
+            
+
+        elif action_id == "reject_alert_modal":
+            # Open Slack modal with note input
+            trigger_id = payload["trigger_id"]
+            slack_client.views_open(
+                trigger_id=trigger_id,
+                view={
+                    "type": "modal",
+                    "callback_id": "submit_rejection_note",
+                    "private_metadata": feedback_id,
+                    "title": {"type": "plain_text", "text": "Reject Feedback"},
+                    "submit": {"type": "plain_text", "text": "Submit"},
+                    "close": {"type": "plain_text", "text": "Cancel"},
+                    "blocks": [
+                        {
+                            "type": "input",
+                            "block_id": "note_block",
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "note_input",
+                                "multiline": True,
+                            },
+                            "label": {
+                                "type": "plain_text",
+                                "text": "Reason for rejection",
+                            },
+                        }
+                    ],
+                },
+            )
+
+    elif (
+        payload_type == "view_submission"
+        and payload["view"]["callback_id"] == "submit_rejection_note"
+    ):
+        feedback_id = payload["view"]["private_metadata"]
+        note = payload["view"]["state"]["values"]["note_block"]["note_input"]["value"]
+        user = payload["user"]["username"]
+
+        feedback = feedback_collection.find_one({"_id": ObjectId(feedback_id)})
+        nhs_number = feedback.get("nhs_number", "unknown")
+
+        # Save to notifications
+        notifications_collection.insert_one(
+            {
+                "nhs_number": nhs_number,
+                "type": "rejected",
+                "message": "Your feedback was reviewed and rejected by the admin.",
+                "note": note,
+                "timestamp": datetime.utcnow(),
+                "read": False,
+                "feedback": {
+                    "comment": feedback.get("comments"),
+                    "category": feedback.get("category"),
+                    "rating": feedback.get("satisfaction_rating"),
+                },
+            }
         )
 
-        slack_client.chat_postMessage(channel=channel_id, text=msg)
+        # Mark as rejected
+        feedback_collection.update_one(
+            {"_id": ObjectId(feedback_id)}, {"$set": {"alert_rejected": True}}
+        )
 
-        return JSONResponse(content={"ok": True}, status_code=200)
+        # 📢 Public alert update in original message
+        slack_client.chat_update(
+            channel=payload["container"]["channel_id"],
+            ts=payload["container"]["message_ts"],
+            text="❌ Feedback rejected",
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"❌ *{user}* rejected this feedback alert.\n> _{note}_",
+                    },
+                }
+            ],
+        )
 
+        #  post it visibly in the channel
+        slack_client.chat_postMessage(
+            channel=os.getenv("SLACK_ALERT_CHANNEL", "#alerts"),
+            text=f"❌ *{user}* rejected alert for feedback `{feedback_id}` with note:\n> {note}",
+        )
+
+        # Respond in Slack (private)
+        # slack_client.chat_postMessage(
+        #     channel=payload["user"]["id"],
+        #     text=f"❌ You rejected feedback `{feedback_id}` with note:\n> {note}",
+        # )
+
+    return JSONResponse(content={"ok": True}, status_code=200)
+
+
+@app.get("/notifications/{nhs_number}")
+async def get_notifications(nhs_number: str):
+    notifications = notifications_collection.find({"nhs_number": nhs_number})
+    results = []
+
+    for n in notifications:
+        results.append(
+            {
+                "type": n.get("type"),
+                "message": n.get("message"),
+                "note": n.get("note", None),  # May not exist for acknowledgments
+                "timestamp": (
+                    n.get("timestamp").isoformat() if n.get("timestamp") else None
+                ),
+                "read": n.get("read", False),
+                "feedback": n.get("feedback", {}),
+            }
+        )
+
+    return {"notifications": results}
+
+
+@app.post("/notifications/mark-read/{nhs_number}")
+async def mark_all_as_read(nhs_number: str):
+    result = notifications_collection.update_many(
+        {"nhs_number": nhs_number, "read": False}, {"$set": {"read": True}}
+    )
+    return {"updated": result.modified_count}
 
 
 @app.websocket("/ws")
