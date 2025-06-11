@@ -40,6 +40,13 @@ def send_slack_alert_with_buttons(feedback: dict, alert_message: str):
                             "action_id": "acknowledge_alert",
                             "style": "primary",
                         },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "❌ Reject"},
+                            "value": feedback_id,
+                            "action_id": "reject_alert_modal",
+                            "style": "danger",
+                        },
                     ],
                 },
             ],
