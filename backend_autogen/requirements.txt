@@ -34,3 +34,4 @@ textblob
 python-multipart
 starlette
 openai>=1.0.0
+agentops
