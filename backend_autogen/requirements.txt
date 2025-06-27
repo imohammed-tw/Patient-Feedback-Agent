@@ -1,0 +1,36 @@
+# Enhanced OpenTelemetry packages for comprehensive tracing
+opentelemetry-api>=1.20.0
+opentelemetry-sdk>=1.20.0
+
+# Core instrumentation
+opentelemetry-instrumentation>=0.41b0
+opentelemetry-instrumentation-requests>=0.41b0
+opentelemetry-instrumentation-urllib3>=0.41b0
+opentelemetry-instrumentation-httpx>=0.41b0
+
+# Exporters for different backends
+opentelemetry-exporter-console>=1.20.0
+opentelemetry-exporter-jaeger-thrift>=1.20.0
+opentelemetry-exporter-otlp-proto-grpc>=1.20.0
+
+# Semantic conventions
+opentelemetry-semantic-conventions>=0.41b0
+
+# Propagators
+opentelemetry-propagator-b3>=1.20.0
+
+# For metrics
+opentelemetry-api[metrics]>=1.20.0
+
+# Existing requirements (keep these)
+autogen-core
+autogen-ext[openai]
+fastapi
+uvicorn
+websockets
+python-dotenv
+pymongo
+textblob
+python-multipart
+starlette
+openai>=1.0.0
