@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 import os
+import agentops
 
 # Import AutoGen Core components
 from autogen_core import (
@@ -34,6 +35,8 @@ from tools import (
     find_common_issues,
     ask_for_feedback_comments,
     start_feedback_rating_prompt,
+    detect_critical_issues,
+    save_feedback_and_show_insights,
 )
 
 # Enhanced OpenTelemetry Tracing Setup
@@ -46,6 +49,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # Setup enhanced tracing
 tracing_config = setup_enhanced_tracing()
 tracer = tracing_config.tracer
+# Initialize AgentOps
+agentops.init()
 
 
 @dataclass
@@ -112,8 +117,8 @@ class FeedbackAgent(RoutedAgent):
 You are a healthcare feedback assistant. Your goal is to collect comprehensive patient feedback following this **EXACT, STRICTLY SEQUENTIAL workflow**. Always be empathetic, professional, and concise.
 
 **Patient Context for Saving Data:**
-- Patient's Name: {patient_name} (USE THIS EXACT VALUE FOR `name` PARAMETER IN `save_feedback_to_database`)
-- Patient's NHS Number: {nhs_number} (USE THIS EXACT VALUE FOR `nhs_number` PARAMETER IN `save_feedback_to_database`)
+- Patient's Name: {patient_name} (USE THIS EXACT VALUE FOR `name` PARAMETER IN `save_feedback_and_show_insights`)
+- Patient's NHS Number: {nhs_number} (USE THIS EXACT VALUE FOR `nhs_number` PARAMETER IN `save_feedback_and_show_insights`)
 
 **Workflow Steps - ADHERE TO THIS ORDER RIGOROUSLY:**
 
@@ -140,22 +145,17 @@ You are a healthcare feedback assistant. Your goal is to collect comprehensive p
    *Response*: Prompt for detailed comments based on rating.
    *IMPORTANT*: If user says just "3" or "2" or any single digit 1-5, treat this as their satisfaction rating.
 
-6. **CATEGORIZATION (Tool: `categorize_feedback`)**:
+6. **DETAILED FEEDBACK WITH CRITICAL DETECTION (Tools: `detect_critical_issues` + `categorize_feedback`)**:
    *Condition*: When user provides detailed comments and you have a rating.
-   *Action*: Use `categorize_feedback` tool with the detailed comments.
-   *Response*: Acknowledge receiving detailed feedback.
+   *Action*: IMMEDIATELY use `detect_critical_issues` tool with the detailed comments. If critical issues are detected, prominently display that it is critical or ugent with an emergency icon . Then use `categorize_feedback` tool with the detailed comments.
+   *Response*: If critical issues found, show the critical alert from detect_critical_issues first, then acknowledge receiving their feedback. If no critical issues, just acknowledge receiving their feedback.
 
-7. **SAVE FEEDBACK (Tool: `save_feedback_to_database`)**:
+7. **SAVE FEEDBACK AND SHOW INSIGHTS (Tool: `save_feedback_and_show_insights`)**:
    *Condition*: After categorization when all data is collected.
-   *Action*: Use `save_feedback_to_database` with: name="{patient_name}", nhs_number="{nhs_number}", rating=user_rating, comments=user_comments, category=categorized_result.
-   *Response*: Confirm feedback has been saved.
+   *Action*: Use `save_feedback_and_show_insights` with: name="{patient_name}", nhs_number="{nhs_number}", rating=user_rating, comments=user_comments, category=categorized_result.
+   *Response*: The tool returns a complete combined response - simply relay this to the user.
 
-8. **SHOW INSIGHTS (Tool: `find_common_issues`)**:
-   *Condition*: After successfully saving feedback.
-   *Action*: Use `find_common_issues` tool to show recurring issues.
-   *Response*: Present common issues to user.
-
-9. **CLOSE CONVERSATION**:
+8. **CLOSE CONVERSATION**:
    *Action*: Thank the user and confirm their feedback helps improve healthcare.
 
 **General Rules:**
@@ -163,7 +163,9 @@ You are a healthcare feedback assistant. Your goal is to collect comprehensive p
 - Only call tools when ALL required parameters are available
 - If information is missing, ask the user for it clearly
 - Remember information from previous exchanges
-- End conversation only after completing all 9 steps
+- CRITICAL: When user provides detailed feedback comments, ALWAYS check for critical issues first using detect_critical_issues tool
+- If critical issues are detected, display the alert prominently and empathetically
+- End conversation only after completing all 8 steps
 """
 
     @message_handler
@@ -395,12 +397,20 @@ class FeedbackSession:
                 description="Categorize feedback into predefined categories. Input: comments (str). Returns category classification.",
             ),
             FunctionTool(
+                detect_critical_issues,
+                description="Detect critical/urgent issues in feedback comments. Input: comments (str). Returns critical alert with icon if issues found, empty string if none.",
+            ),
+            FunctionTool(
                 save_feedback_to_database,
                 description="Save patient feedback to database. Input: name (str), nhs_number (str), rating (int), comments (str), category (str). Returns save confirmation.",
             ),
             FunctionTool(
                 find_common_issues,
                 description="Find recurring issues from all feedback. No input required. Returns common issues summary.",
+            ),
+            FunctionTool(
+                save_feedback_and_show_insights,
+                description="Save patient feedback to database AND show common issues in one combined response. Input: name (str), nhs_number (str), rating (int), comments (str), category (str). Returns complete response with save confirmation and common issues.",
             ),
         ]
         return tools
