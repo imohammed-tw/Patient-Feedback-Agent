@@ -8,7 +8,7 @@ import {
   WrenchScrewdriverIcon
 } from "@heroicons/react/24/outline";
 import { useEffect, useRef, useState } from "react";
-
+import ReactMarkdown from "react-markdown";
 export default function AgentPage() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
@@ -238,8 +238,8 @@ export default function AgentPage() {
                 {msg.sender === "bot" ? (
                   <>
                     <CpuChipIcon className="w-6 h-6 text-green-400 mt-3 flex-shrink-0" />
-                    <div className="bg-gray-700 p-3 rounded-md max-w-[70%] break-words">
-                      {msg.text}
+                    <div className="bg-gray-700 p-3 rounded-md max-w-[70%] prose prose-invert break-words">
+                      <ReactMarkdown>{msg.text}</ReactMarkdown>
                     </div>
                   </>
                 ) : (
