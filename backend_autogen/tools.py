@@ -236,15 +236,92 @@ def find_common_issues() -> str:
                 :3
             ]
 
-            # Format the result string
-            result = "Top issues our team is actively working on:\n"
+            # Format the result with better markdown formatting
+            result = (
+                "**📝 Here are the top issues our team is actively working on:**\n\n"
+            )
             for i, (issue, count) in enumerate(top_issues, 1):
-                result += f"{i}. {issue} ({count} mentions)\n"
+                result += f"{i}. **{issue}**\n"
 
-            return result.strip()  # Remove any trailing whitespace
+            result += "\n_We appreciate your feedback as it helps us prioritize these improvements._"
+            return result.strip()
 
         except Exception as e:
             return f"Error retrieving common issues from database: {str(e)}"
+
+
+def detect_critical_issues(comments: str) -> str:
+    """
+    Analyzes feedback comments for critical keywords that indicate urgent issues requiring immediate attention.
+    Returns a formatted alert if critical issues are detected, or empty string if none found.
+
+    Args:
+        comments (str): Feedback comments to analyze for critical issues
+
+    Returns:
+        str: Critical issue alert with icon and description, or empty string
+    """
+    with tracer.start_as_current_span("Tool.detect_critical_issues"):
+        if not comments:
+            return ""
+
+        # Critical keywords with their descriptions
+        critical_keywords = {
+            "emergency": "Emergency response concerns",
+            "died": "Potential mortality incident",
+            "death": "Potential mortality incident",
+            "mistake": "Potential medical error",
+            "error": "Potential medical error",
+            "wrong medication": "Medication error",
+            "wrong medicine": "Medication error",
+            "allergic reaction": "Adverse reaction",
+            "fall": "Patient safety incident",
+            "fell": "Patient safety incident",
+            "infection": "Infection control issue",
+            "contamination": "Infection control issue",
+            "unsanitary": "Infection control issue",
+            "neglect": "Patient neglect concern",
+            "ignored": "Patient neglect concern",
+            "lawsuit": "Legal concern raised",
+            "sue": "Legal concern raised",
+            "legal": "Legal concern raised",
+            "blood": "Blood urgency or lack of Blood",
+            "urgent": "Immediate action or medication",
+            "unresponsive": "Unresponsive patient care or staff negligence",
+            "bleeding": "Excessive or unmanaged bleeding reported",
+            "overdose": "Medication overdose incident",
+            "unattended": "Patient left unattended for a long period",
+            "contagious": "Possible contagious condition not isolated",
+            "fracture": "Injury/fracture due to negligence",
+            "icu delay": "Delay in moving critical patient to ICU",
+            "misdiagnosed": "Potential misdiagnosis incident",
+            "collapsed": "Physical collapse or serious deterioration",
+            "oxygen problem": "Oxygen supply issue",
+        }
+
+        comments_lower = comments.lower()
+        detected_issues = []
+
+        # Check for critical keywords
+        for keyword, description in critical_keywords.items():
+            if keyword in comments_lower:
+                detected_issues.append(description)
+
+        if detected_issues:
+            # Remove duplicates and format the alert
+            unique_issues = list(set(detected_issues))
+
+            # Create formatted critical alert with icon
+            alert = "🚨 **CRITICAL** 🚨\n\n"
+            # alert += "⚠️ _This feedback contains indicators of urgent issues that require immediate attention:_\n\n"
+
+            for issue in unique_issues[:3]:  # Show max 3 critical issues
+                alert += f"• **{issue}**\n"
+
+            alert += "\n🔔 _Your feedback has been flagged for priority review by our healthcare team._"
+            return alert
+
+        return ""  # No critical issues detected
 
 
 def save_feedback_to_database(
@@ -309,6 +386,54 @@ def save_feedback_to_database(
             return f"Error saving feedback to database: {str(e)}"
 
 
+def save_feedback_and_show_insights(
+    name: str, nhs_number: str, rating: Union[int, str], comments: str, category: str
+) -> str:
+    """
+    Combined function that saves feedback to database AND shows common issues in one response.
+    This provides a better user experience with a single, comprehensive response.
+
+    Args:
+        name (str): Patient's name
+        nhs_number (str): Patient's NHS number
+        rating (Union[int, str]): Satisfaction rating (1-5)
+        comments (str): Detailed feedback comments
+        category (str): Categorized feedback type
+
+    Returns:
+        str: Combined response with save confirmation and common issues
+    """
+    with tracer.start_as_current_span("Tool.save_feedback_and_show_insights"):
+
+        # First, save the feedback
+        save_result = save_feedback_to_database(
+            name, nhs_number, rating, comments, category
+        )
+
+        # Check if save was successful
+        if "successfully" not in save_result.lower():
+            # If save failed, return the error
+            return save_result
+
+        # If save was successful, get common issues
+        common_issues = find_common_issues()
+
+        # Create combined response
+        combined_response = f"Thank you, {name}! Your feedback has been successfully saved and will help us improve our healthcare services.\n\n"
+
+        # Add common issues section
+        if (
+            "No feedback records" not in common_issues
+            and "No common issues" not in common_issues
+        ):
+            combined_response += f"{common_issues}\n\n"
+            combined_response += "Your feedback is valuable in helping us address these priority areas and enhance patient care."
+        else:
+            combined_response += "Your feedback is the first in our system and will help us start tracking improvement areas."
+
+        return combined_response
+
+
 def generate_trend_analysis() -> str:
     """
     Generates a summary report of feedback trends.
@@ -356,6 +481,54 @@ def generate_trend_analysis() -> str:
 
         except Exception as e:
             return f"Error generating trend analysis: {str(e)}"
+
+
+def save_feedback_and_show_insights(
+    name: str, nhs_number: str, rating: Union[int, str], comments: str, category: str
+) -> str:
+    """
+    Combined function that saves feedback to database AND shows common issues in one response.
+    This provides a better user experience with a single, comprehensive response.
+
+    Args:
+        name (str): Patient's name
+        nhs_number (str): Patient's NHS number
+        rating (Union[int, str]): Satisfaction rating (1-5)
+        comments (str): Detailed feedback comments
+        category (str): Categorized feedback type
+
+    Returns:
+        str: Combined response with save confirmation and common issues
+    """
+    with tracer.start_as_current_span("Tool.save_feedback_and_show_insights"):
+
+        # First, save the feedback
+        save_result = save_feedback_to_database(
+            name, nhs_number, rating, comments, category
+        )
+
+        # Check if save was successful
+        if "successfully" not in save_result.lower():
+            # If save failed, return the error
+            return save_result
+
+        # If save was successful, get common issues
+        common_issues = find_common_issues()
+
+        # Create combined response
+        combined_response = f"Thank you, {name}! Your feedback has been successfully saved and will help us improve our healthcare services.\n\n"
+
+        # Add common issues section
+        if (
+            "No feedback records" not in common_issues
+            and "No common issues" not in common_issues
+        ):
+            combined_response += f"{common_issues}\n\n"
+            combined_response += "Your feedback is valuable in helping us address these priority areas and enhance patient care."
+        else:
+            combined_response += "Your feedback is the first in our system and will help us start tracking improvement areas."
+
+        return combined_response
 
 
 # Async wrapper functions (if needed for future async database operations)
