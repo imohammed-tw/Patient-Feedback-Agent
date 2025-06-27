@@ -88,6 +88,38 @@ The **NHS Patient Feedback Agent** is a conversational AI system built to collec
 
 **System Architecture Diagram:**
 
+```mermaid
+graph TB
+    Client[Frontend Client] -->|WebSocket| FastAPI[FastAPI Server]
+    FastAPI --> UserSession[UserSession Manager]
+    UserSession --> FeedbackSession[FeedbackSession]
+    FeedbackSession --> Runtime[SingleThreadedAgentRuntime]
+    Runtime --> FeedbackAgent[FeedbackAgent]
+
+    FeedbackAgent --> OpenAI[OpenAI GPT-4o-mini]
+    FeedbackAgent --> Tools[Tool Execution Layer]
+
+    Tools --> Sentiment[Sentiment Analysis]
+    Tools --> Critical[Critical Detection]
+    Tools --> Category[Categorization]
+    Tools --> Database[MongoDB Storage]
+    Tools --> Analytics[Common Issues]
+
+    FeedbackAgent --> Tracing[Observability Layer]
+    Tracing --> OpenTelemetry[OpenTelemetry]
+    Tracing --> AgentOps[AgentOps]
+    Tracing --> FileExport[File Exporters]
+
+    Database --> MongoDB[(MongoDB)]
+    FileExport --> Logs[logs/ Directory]
+
+    style FeedbackAgent fill:#e1f5fe
+    style OpenAI fill:#fff3e0
+    style Tools fill:#f3e5f5
+    style Tracing fill:#e8f5e8
+```
+
+
 **🔧 Core Components**
 
 ### **1\. FeedbackAgent (RoutedAgent)**
@@ -195,6 +227,7 @@ logs/
 
   * Send trend analysis daily  
   * Critical Alerts for admins if critical issue keywords spike, implemented through slack app interaction and shortcuts feature.
+
 
 ![img2](https://github.com/user-attachments/assets/5f39c0d8-708c-45d3-840c-2776a481f302)
 
