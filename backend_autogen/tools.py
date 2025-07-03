@@ -370,6 +370,14 @@ def save_feedback_to_database(
             }
 
             result = feedback_collection.insert_one(feedback_doc)
+            alerts_sent = scan_critical_issues_and_alert()
+
+            if alerts_sent > 0:
+                print(
+                    f"🚨 {alerts_sent} critical alerts sent to Slack for recent feedback"
+                )
+            else:
+                print("✅ No critical issues detected in recent feedback")
 
             if result.inserted_id:
                 # Return a simple, parseable success message for the agent
@@ -384,7 +392,6 @@ def save_feedback_to_database(
         except Exception as e:
             # Catch any exceptions during database operation and return an informative error message
             return f"Error saving feedback to database: {str(e)}"
-
 
 def save_feedback_and_show_insights(
     name: str, nhs_number: str, rating: Union[int, str], comments: str, category: str
