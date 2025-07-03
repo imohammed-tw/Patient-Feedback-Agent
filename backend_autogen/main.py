@@ -15,6 +15,12 @@ import os, time, hmac, hashlib, json
 # Import the updated FeedbackSession class and create_feedback_assistant function from agent_autogen
 from agent_autogen import FeedbackSession, create_feedback_assistant
 
+# Import Slack and scheduling functionality
+from alerts import send_slack_alert_with_buttons, test_slack_connection
+from admin_alerts import scan_critical_issues_and_alert
+from scheduler import start_scheduler, stop_scheduler, feedback_scheduler
+from slack_sdk import WebClient
+
 # Load environment variables (e.g., MongoDB URI, API keys)
 load_dotenv()
 
@@ -22,6 +28,27 @@ load_dotenv()
 tracing_config = setup_enhanced_tracing()
 tracer = tracing_config.tracer
 app = FastAPI()
+
+# Start scheduler
+start_scheduler()
+
+# Slack configuration
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+SLACK_ALERT_CHANNEL = os.getenv("SLACK_ALERT_CHANNEL", "#alerts")
+
+# Initialize Slack client
+slack_client = None
+if SLACK_BOT_TOKEN:
+    slack_client = WebClient(token=SLACK_BOT_TOKEN)
+    # Test connection on startup
+    if test_slack_connection():
+        print("✅ Slack integration ready")
+    else:
+        print("⚠️ Slack integration failed - alerts will be disabled")
+else:
+    print("⚠️ SLACK_BOT_TOKEN not found - Slack alerts disabled")
+
 
 # FastAPI Middleware for Cross-Origin Resource Sharing (CORS)
 app.add_middleware(
@@ -173,6 +200,385 @@ User Information:
             self._initialized = False
         except Exception as e:
             print(f"Error during UserSession cleanup: {str(e)}")
+
+
+@app.post("/slack/interaction")
+async def slack_interaction_handler(request: Request):
+    """Handle Slack interactive components (buttons, modals)"""
+
+    if not SLACK_SIGNING_SECRET or not slack_client:
+        raise HTTPException(status_code=503, detail="Slack integration not configured")
+
+    # ✅ 1. Signature validation
+    body = await request.body()
+    timestamp = request.headers.get("X-Slack-Request-Timestamp")
+    slack_signature = request.headers.get("X-Slack-Signature")
+
+    if not timestamp or not slack_signature:
+        raise HTTPException(status_code=403, detail="Missing Slack headers")
+
+    if abs(time.time() - int(timestamp)) > 60 * 5:
+        raise HTTPException(status_code=403, detail="Request too old")
+
+    sig_basestring = f"v0:{timestamp}:{body.decode('utf-8')}"
+    my_signature = (
+        "v0="
+        + hmac.new(
+            SLACK_SIGNING_SECRET.encode(), sig_basestring.encode(), hashlib.sha256
+        ).hexdigest()
+    )
+
+    if not hmac.compare_digest(my_signature, slack_signature):
+        raise HTTPException(status_code=403, detail="Invalid Slack signature")
+
+    # ✅ 2. Parse payload
+    try:
+        form_data = await request.form()
+        payload = json.loads(form_data["payload"])
+        payload_type = payload.get("type")
+
+        print(f"🔍 Payload type: {payload_type}")
+
+    except Exception as e:
+        print(f"❌ Payload parsing error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid payload: {str(e)}")
+
+    # Handle block actions (button clicks)
+    if payload_type == "block_actions":
+        try:
+            action_id = payload["actions"][0]["action_id"]
+            feedback_id = payload["actions"][0]["value"]
+            channel_id = payload["channel"]["id"]
+            user = payload["user"]["username"]
+
+            print(f"🔍 Received action_id: {action_id}")
+            print(f"🔍 Feedback ID: {feedback_id}")
+
+            # Validate ObjectId format
+            try:
+                obj_id = ObjectId(feedback_id)
+            except Exception as e:
+                print(f"❌ Invalid ObjectId format: {feedback_id}")
+                try:
+                    slack_client.chat_postMessage(
+                        channel=channel_id, text="❌ Invalid feedback ID format."
+                    )
+                except:
+                    pass
+                return JSONResponse(content={"ok": True})
+
+            # Find feedback document
+            try:
+                feedback = feedback_collection.find_one({"_id": obj_id})
+                if not feedback:
+                    print(f"❌ Feedback not found: {feedback_id}")
+                    try:
+                        slack_client.chat_postMessage(
+                            channel=channel_id, text="❌ Feedback not found."
+                        )
+                    except:
+                        pass
+                    return JSONResponse(content={"ok": True})
+            except Exception as e:
+                print(f"❌ Database error: {str(e)}")
+                try:
+                    slack_client.chat_postMessage(
+                        channel=channel_id, text="❌ Database error occurred."
+                    )
+                except:
+                    pass
+                return JSONResponse(content={"ok": True})
+
+            nhs_number = feedback.get("nhs_number", "unknown")
+            user_doc = users_collection.find_one({"nhs number.number": nhs_number})
+            nhs_data = user_doc.get("nhs number", {}) if user_doc else {}
+
+            if action_id == "acknowledge_alert":
+                try:
+                    # Mark feedback as acknowledged
+                    feedback_collection.update_one(
+                        {"_id": obj_id}, {"$set": {"alert_acknowledged": True}}
+                    )
+
+                    notifications_collection.insert_one(
+                        {
+                            "nhs_number": nhs_number,
+                            "type": "acknowledged",
+                            "message": "Your feedback was reviewed and acknowledged by the admin.",
+                            "timestamp": datetime.utcnow(),
+                            "read": False,
+                            "feedback": {
+                                "comment": feedback.get("comments"),
+                                "category": feedback.get("category"),
+                                "rating": feedback.get("satisfaction_rating"),
+                            },
+                        }
+                    )
+
+                    # Update original message to show acknowledgment
+                    slack_client.chat_update(
+                        channel=channel_id,
+                        ts=payload["message"]["ts"],
+                        text="✅ Feedback acknowledged",
+                        blocks=[
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": f"✅ *{user}* acknowledged this feedback alert at {datetime.now().strftime('%H:%M:%S')}.",
+                                },
+                            }
+                        ],
+                    )
+
+                    slack_client.chat_postMessage(
+                        channel=channel_id,
+                        text=f"✅ *{user}* acknowledged alert for feedback `{feedback_id}`",
+                    )
+
+                    print(f"✅ Acknowledge action completed for {feedback_id}")
+                    return JSONResponse(content={"ok": True})
+
+                except Exception as e:
+                    print(f"❌ Error in acknowledge_alert: {str(e)}")
+                    return JSONResponse(content={"ok": True})
+
+            elif action_id == "view_patient":
+                try:
+                    # Show patient details
+                    if not user_doc:
+                        slack_client.chat_postMessage(
+                            channel=channel_id, text="❌ Patient not found."
+                        )
+                        return JSONResponse(content={"ok": True})
+
+                    feedback_time = feedback["_id"].generation_time.strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+
+                    patient_details = (
+                        f"*👤 Patient Details:*\n"
+                        f"> *Name:* {user_doc.get('name', 'Unknown')}\n"
+                        f"> *NHS Number:* {nhs_number}\n"
+                        f"> *Age:* {nhs_data.get('age', 'N/A')}\n"
+                        f"> *Gender:* {nhs_data.get('gender', 'N/A')}\n"
+                        f"> *Health Issue:* {nhs_data.get('health_issue', 'N/A')}\n"
+                        f"> *Date of Treatment:* {nhs_data.get('date_of_treatment', 'N/A')}\n\n"
+                        f"*📝 Feedback Details:*\n"
+                        f"> *Submitted On:* {feedback_time}\n"
+                        f"> *Rating:* {feedback.get('satisfaction_rating', 'N/A')}/5\n"
+                        f"> *Category:* {feedback.get('category', 'N/A')}\n"
+                        f"> *Comment:* {feedback.get('comments', 'N/A')}"
+                    )
+
+                    slack_client.chat_postMessage(
+                        channel=channel_id, text=patient_details
+                    )
+                    print(f"✅ View patient action completed for {feedback_id}")
+                    return JSONResponse(content={"ok": True})
+
+                except Exception as e:
+                    print(f"❌ Error in view_patient: {str(e)}")
+                    return JSONResponse(content={"ok": True})
+
+            elif action_id == "reject_alert_modal":
+                try:
+                    # Open modal for rejection reason
+                    trigger_id = payload["trigger_id"]
+                    slack_client.views_open(
+                        trigger_id=trigger_id,
+                        view={
+                            "type": "modal",
+                            "callback_id": "submit_rejection_note",
+                            "private_metadata": feedback_id,
+                            "title": {
+                                "type": "plain_text",
+                                "text": "Reject Feedback Alert",
+                            },
+                            "submit": {"type": "plain_text", "text": "Submit"},
+                            "close": {"type": "plain_text", "text": "Cancel"},
+                            "blocks": [
+                                {
+                                    "type": "input",
+                                    "block_id": "note_block",
+                                    "element": {
+                                        "type": "plain_text_input",
+                                        "action_id": "note_input",
+                                        "multiline": True,
+                                        "placeholder": {
+                                            "type": "plain_text",
+                                            "text": "Please provide a reason for rejecting this alert...",
+                                        },
+                                    },
+                                    "label": {
+                                        "type": "plain_text",
+                                        "text": "Reason for rejection",
+                                    },
+                                }
+                            ],
+                        },
+                    )
+
+                    print(f"✅ Modal opened for rejection: {feedback_id}")
+                    return JSONResponse(content={"ok": True})
+
+                except Exception as e:
+                    print(f"❌ Error opening modal: {str(e)}")
+                    return JSONResponse(content={"ok": True})
+
+            else:
+                print(f"❌ Unknown action_id: {action_id}")
+                return JSONResponse(content={"ok": True})
+
+        except Exception as e:
+            print(f"❌ Error in block_actions handling: {str(e)}")
+            return JSONResponse(content={"ok": True})
+
+    # Handle modal submissions
+    elif (
+        payload_type == "view_submission"
+        and payload["view"]["callback_id"] == "submit_rejection_note"
+    ):
+        try:
+            feedback_id = payload["view"]["private_metadata"]
+            note = payload["view"]["state"]["values"]["note_block"]["note_input"][
+                "value"
+            ]
+            user = payload["user"]["username"]
+
+            # Validate ObjectId
+            try:
+                obj_id = ObjectId(feedback_id)
+            except:
+                print(f"❌ Invalid ObjectId in modal submission: {feedback_id}")
+                return JSONResponse(content={"ok": True})
+
+            feedback = feedback_collection.find_one({"_id": obj_id})
+            nhs_number = (
+                feedback.get("nhs_number", "unknown") if feedback else "unknown"
+            )
+
+            # Save to notifications
+            notifications_collection.insert_one(
+                {
+                    "nhs_number": nhs_number,
+                    "type": "rejected",
+                    "message": "Your feedback was reviewed and rejected by the admin.",
+                    "note": note,
+                    "timestamp": datetime.utcnow(),
+                    "read": False,
+                    "feedback": {
+                        "comment": feedback.get("comments"),
+                        "category": feedback.get("category"),
+                        "rating": feedback.get("satisfaction_rating"),
+                    },
+                }
+            )
+
+            # Mark as rejected
+            feedback_collection.update_one(
+                {"_id": obj_id}, {"$set": {"alert_rejected": True}}
+            )
+
+            # Modal submissions might not have the same structure as button clicks
+            try:
+                # Try to get the original message info from the view
+                # Modal submissions use different payload structure
+                if "view" in payload and "root_view_id" in payload["view"]:
+                    # For modal submissions, we need to find the original message differently
+                    # Let's post a new message instead of trying to update the original
+                    slack_client.chat_postMessage(
+                        channel=SLACK_ALERT_CHANNEL,
+                        text=f"❌ *{user}* rejected alert for feedback `{feedback_id}`",
+                        blocks=[
+                            {
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": f"❌ *{user}* rejected this feedback alert.\n> *Reason:* {note}",
+                                },
+                            }
+                        ],
+                    )
+                else:
+                    # Fallback: try the original approach if container exists
+                    if "container" in payload:
+                        slack_client.chat_update(
+                            channel=payload["container"]["channel_id"],
+                            ts=payload["container"]["message_ts"],
+                            text="❌ Feedback alert rejected",
+                            blocks=[
+                                {
+                                    "type": "section",
+                                    "text": {
+                                        "type": "mrkdwn",
+                                        "text": f"❌ *{user}* rejected this feedback alert.\n> *Reason:* {note}",
+                                    },
+                                }
+                            ],
+                        )
+                    else:
+                        # Just post a new message
+                        slack_client.chat_postMessage(
+                            channel=SLACK_ALERT_CHANNEL,
+                            text=f"❌ *{user}* rejected alert for feedback `{feedback_id}` with note:\n> {note}",
+                        )
+            except Exception as slack_error:
+                print(f"⚠️ Slack message update failed: {str(slack_error)}")
+                # Even if Slack update fails, we still processed the rejection successfully
+
+            print(f"✅ Modal submission completed for {feedback_id}")
+            return JSONResponse(content={"ok": True})
+
+        except Exception as e:
+            print(f"❌ Error in modal submission: {str(e)}")
+            return JSONResponse(content={"ok": True})
+
+    else:
+        print(f"❌ Unknown payload type: {payload_type}")
+        return JSONResponse(content={"ok": True})
+
+
+@app.get("/notifications/{nhs_number}")
+async def get_notifications(nhs_number: str):
+    """Get all notifications for a specific NHS number"""
+    try:
+        notifications = notifications_collection.find({"nhs_number": nhs_number})
+        results = []
+
+        for n in notifications:
+            results.append(
+                {
+                    "type": n.get("type"),
+                    "message": n.get("message"),
+                    "note": n.get("note", None),  # May not exist for acknowledgments
+                    "timestamp": (
+                        n.get("timestamp").isoformat() if n.get("timestamp") else None
+                    ),
+                    "read": n.get("read", False),
+                    "feedback": n.get("feedback", {}),
+                }
+            )
+
+        return {"notifications": results}
+
+    except Exception as e:
+        print(f"❌ Error fetching notifications: {str(e)}")
+        return {"notifications": []}
+
+
+@app.post("/notifications/mark-read/{nhs_number}")
+async def mark_all_as_read(nhs_number: str):
+    """Mark all notifications as read for a specific NHS number"""
+    try:
+        result = notifications_collection.update_many(
+            {"nhs_number": nhs_number, "read": False}, {"$set": {"read": True}}
+        )
+        return {"updated": result.modified_count}
+
+    except Exception as e:
+        print(f"❌ Error marking notifications as read: {str(e)}")
+        return {"updated": 0}
 
 
 # Root endpoint to confirm API is running
