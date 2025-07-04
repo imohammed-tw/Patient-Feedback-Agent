@@ -4,44 +4,33 @@ from starlette.responses import JSONResponse
 from dotenv import load_dotenv
 from datetime import datetime
 from bson.objectid import ObjectId
-
-# Assuming models.py and database.py are correctly set up and contain necessary definitions
 from models import RegisterRequest, LoginRequest
 from database import users_collection, feedback_collection, notifications_collection
 from tracing_config import setup_enhanced_tracing, get_tracing_config
 import asyncio
 import os, time, hmac, hashlib, json
-
-# Import the updated FeedbackSession class and create_feedback_assistant function from agent_autogen
 from agent_autogen import FeedbackSession, create_feedback_assistant
-
-# Import Slack and scheduling functionality
 from alerts import send_slack_alert_with_buttons, test_slack_connection
 from admin_alerts import scan_critical_issues_and_alert
 from scheduler import start_scheduler, stop_scheduler, feedback_scheduler
 from slack_sdk import WebClient
 
-# Load environment variables (e.g., MongoDB URI, API keys)
 load_dotenv()
 
-# Setup enhanced tracing
 tracing_config = setup_enhanced_tracing()
 tracer = tracing_config.tracer
 app = FastAPI()
 
-# Start scheduler
 start_scheduler()
 
-# Slack configuration
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 SLACK_ALERT_CHANNEL = os.getenv("SLACK_ALERT_CHANNEL", "#alerts")
 
-# Initialize Slack client
 slack_client = None
 if SLACK_BOT_TOKEN:
     slack_client = WebClient(token=SLACK_BOT_TOKEN)
-    # Test connection on startup
+    
     if test_slack_connection():
         print("✅ Slack integration ready")
     else:
@@ -166,7 +155,6 @@ User Information:
                 return response
 
             except Exception as e:
-                # Log the error and reset the conversation
                 print(
                     f"Error in UserSession.process_message for NHS: {self.user_context.get('nhs_number', 'Unknown')}: {str(e)}"
                 )
@@ -231,7 +219,7 @@ async def slack_interaction_handler(request: Request):
     if not hmac.compare_digest(my_signature, slack_signature):
         raise HTTPException(status_code=403, detail="Invalid Slack signature")
 
-    # ✅ 2. Parse payload
+    #  2. Parse payload
     try:
         form_data = await request.form()
         payload = json.loads(form_data["payload"])
@@ -295,7 +283,6 @@ async def slack_interaction_handler(request: Request):
 
             if action_id == "acknowledge_alert":
                 try:
-                    # Mark feedback as acknowledged
                     feedback_collection.update_one(
                         {"_id": obj_id}, {"$set": {"alert_acknowledged": True}}
                     )
@@ -315,7 +302,6 @@ async def slack_interaction_handler(request: Request):
                         }
                     )
 
-                    # Update original message to show acknowledgment
                     slack_client.chat_update(
                         channel=channel_id,
                         ts=payload["message"]["ts"],
@@ -345,7 +331,6 @@ async def slack_interaction_handler(request: Request):
 
             elif action_id == "view_patient":
                 try:
-                    # Show patient details
                     if not user_doc:
                         slack_client.chat_postMessage(
                             channel=channel_id, text="❌ Patient not found."
@@ -480,13 +465,10 @@ async def slack_interaction_handler(request: Request):
                 {"_id": obj_id}, {"$set": {"alert_rejected": True}}
             )
 
-            # Modal submissions might not have the same structure as button clicks
             try:
-                # Try to get the original message info from the view
                 # Modal submissions use different payload structure
                 if "view" in payload and "root_view_id" in payload["view"]:
-                    # For modal submissions, we need to find the original message differently
-                    # Let's post a new message instead of trying to update the original
+                    
                     slack_client.chat_postMessage(
                         channel=SLACK_ALERT_CHANNEL,
                         text=f"❌ *{user}* rejected alert for feedback `{feedback_id}`",
