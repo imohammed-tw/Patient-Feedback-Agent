@@ -6,7 +6,7 @@ from admin_alerts import scan_critical_issues_and_alert, send_critical_feedback_
 from database import feedback_collection
 import time
 from datetime import datetime, timedelta
-
+from bson.objectid import ObjectId
 
 def send_trend_summary():
     """
@@ -15,17 +15,14 @@ def send_trend_summary():
     try:
         print("📤 Sending scheduled trend report...")
 
-        # Get trend analysis from our existing tools
         trend_report = generate_trend_analysis()
         common_issues = find_common_issues()
 
-        # Get recent feedback count (last 24 hours)
         yesterday = datetime.now() - timedelta(days=1)
         recent_feedback_count = feedback_collection.count_documents(
             {"_id": {"$gte": ObjectId.from_datetime(yesterday)}}
         )
 
-        # Format the summary message
         summary = (
             f"📢 *Daily Feedback Trend Analysis - {datetime.now().strftime('%Y-%m-%d')}*\n\n"
             f" *Recent Activity:*\n"
@@ -36,7 +33,6 @@ def send_trend_summary():
             f"{common_issues}\n\n"
         )
 
-        # Send to Slack
         success = send_slack_alert(summary)
 
         if success:
@@ -68,17 +64,7 @@ class FeedbackScheduler:
             send_trend_summary, "cron", hour=9, minute=0, id="daily_trend_summary"
         )
 
-        # Weekly summary on Mondays at 10 AM
-        # self.scheduler.add_job(
-        #     send_weekly_summary,
-        #     "cron",
-        #     day_of_week="mon",
-        #     hour=10,
-        #     minute=0,
-        #     id="weekly_summary",
-        # )
-
-        # For testing: Run trend summary every 5 minutes (comment out in production)
+        # For testing: Run trend summary every 5 minutes 
         self.scheduler.add_job(
             send_trend_summary, "interval", minutes=5, id="test_trend_summary"
         )
@@ -127,7 +113,6 @@ class FeedbackScheduler:
             return False
 
 
-# Global scheduler instance
 feedback_scheduler = FeedbackScheduler()
 
 
@@ -141,5 +126,4 @@ def stop_scheduler():
     feedback_scheduler.stop()
 
 
-# Import ObjectId for datetime operations
-from bson.objectid import ObjectId
+
