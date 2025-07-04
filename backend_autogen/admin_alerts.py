@@ -10,7 +10,7 @@ def scan_critical_issues_and_alert():
     Not part of the AI agent tools. Meant to be called manually or via scheduler.
     """
 
-    # Same critical keywords as in detect_critical_issues tool
+  
     critical_keywords = {
         "emergency": "Emergency response concerns",
         "died": "Potential mortality incident",
@@ -44,7 +44,7 @@ def scan_critical_issues_and_alert():
         "oxygen problem": "Oxygen supply issue",
     }
 
-    print("🔍 Scanning for critical feedback issues...")
+    print(" Scanning for critical feedback issues...")
     alerts_sent = 0
 
     try:
@@ -55,7 +55,7 @@ def scan_critical_issues_and_alert():
                 {"alert_rejected": {"$ne": True}},
                 {
                     "slack_alert_sent": {"$ne": True}
-                },  # New flag to prevent duplicate alerts
+                },  # flag to prevent duplicate alerts
             ]
         }
 
@@ -63,22 +63,22 @@ def scan_critical_issues_and_alert():
             comment = feedback.get("comments", "").lower()
             matched_keywords = []
 
-            # Check for all matching keywords
+            
             for keyword, description in critical_keywords.items():
                 if keyword in comment:
                     matched_keywords.append(description)
 
             if matched_keywords:
-                # Use the first matched critical issue as the main alert message
+                
                 primary_alert = matched_keywords[0]
 
-                # Add count if multiple issues detected
+                
                 if len(matched_keywords) > 1:
                     primary_alert += (
                         f" (+{len(matched_keywords)-1} other critical issues)"
                     )
 
-                # Send Slack alert
+                
                 if send_slack_alert_with_buttons(feedback, primary_alert):
                     # Mark as alerted to prevent duplicate notifications
                     feedback_collection.update_one(
@@ -177,7 +177,7 @@ def send_critical_feedback_summary():
             f"📋 *Critical Feedback Summary* ({len(critical_items)} items)\n\n"
         )
 
-        for item in critical_items[:10]:  # Limit to 10 most recent
+        for item in critical_items[:10]:  
             patient_name = item.get("patient_name", "Unknown")
             issues = item.get("critical_issues", ["Unknown issue"])
             primary_issue = issues[0] if issues else "Unknown issue"
