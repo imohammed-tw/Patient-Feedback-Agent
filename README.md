@@ -238,7 +238,13 @@ logs/
 ```bash
 # Clone the repository
 git clone ...
-cd backend
+
+#Frontend
+cd frontend
+npm i
+
+#Backend
+cd backend_autogen
 
 # Install uv (if not installed)
 pip install uv
