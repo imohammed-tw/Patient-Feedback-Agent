@@ -234,4 +234,30 @@ logs/
 ![img3](https://github.com/user-attachments/assets/a1c50ca6-e9fd-436b-b956-09388eb50732)
 
 
+# Build Instructions:
+```bash
+# Clone the repository
+git clone ...
+cd backend
+
+# Install uv (if not installed)
+pip install uv
+
+# Create virtual environment
+uv venv
+
+# Activate environment
+# CMD
+.venv\Scripts\activate
+# PowerShell
+.\.venv\Scripts\Activate.ps1
+
+
+# Install dependencies
+uv pip install -r requirements1.txt
+
+# Run FastAPI app
+uv run uvicorn app.main:app --reload
+
+
 
